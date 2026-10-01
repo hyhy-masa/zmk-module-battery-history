@@ -17,6 +17,7 @@
 #include <zmk/battery_history/events/battery_history_entry_event.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/activity_state_changed.h>
+#include <zmk/workqueue.h>
 #include <zmk/events/battery_state_changed.h>
 
 LOG_MODULE_REGISTER(zmk_battery_history, CONFIG_ZMK_LOG_LEVEL);
@@ -47,6 +48,28 @@ static uint16_t timestamp_offset = 0; // For clearing history
 // Work item for periodic recording
 static void battery_history_work_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(battery_history_work, battery_history_work_handler);
+
+/*
+ * minimal-keys: the periodic record/save runs on the low priority work queue, not the system
+ * work queue. A save calls settings_save_one() once per changed entry, and each call can scan
+ * every stored settings name on flash; on the owner's keyboard this held the system work queue
+ * for 4.1 s and 5.6 s (diag6, 2026-10-01). Key events from the other half are consumed on the
+ * system work queue, so they waited the whole time.
+ *
+ * Moving the work makes it preemptible by the system work queue, so the buffer state is now
+ * shared between threads that can interleave: bh_lock serialises every path that touches it.
+ * A thread on the system work queue that takes the lock (only the sleep listener) may wait for
+ * a save in progress; that happens only when the keyboard is going idle.
+ */
+static K_MUTEX_DEFINE(bh_lock);
+
+static void bh_schedule(k_timeout_t delay) {
+    k_work_schedule_for_queue(zmk_workqueue_lowprio_work_q(), &battery_history_work, delay);
+}
+
+static void bh_reschedule(k_timeout_t delay) {
+    k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &battery_history_work, delay);
+}
 
 // Current battery level cache
 static uint8_t current_battery_level = 0;
@@ -140,7 +163,16 @@ static int set_single_entry(int buffer_idx) {
 /**
  * Save history to persistent storage (incremental save)
  */
+static int save_history_locked(void);
+
 static int save_history(void) {
+    k_mutex_lock(&bh_lock, K_FOREVER); /* recursive for the owner thread */
+    int rc = save_history_locked();
+    k_mutex_unlock(&bh_lock);
+    return rc;
+}
+
+static int save_history_locked(void) {
     if (!initialization_done) {
         LOG_WRN("Settings not loaded yet, skipping battery history save");
         return 0;
@@ -282,7 +314,15 @@ static bool should_record_entry(uint16_t timestamp, uint8_t level) {
 /**
  * Record current battery level to history
  */
+static void record_battery_level_locked(void);
+
 static void record_battery_level() {
+    k_mutex_lock(&bh_lock, K_FOREVER);
+    record_battery_level_locked();
+    k_mutex_unlock(&bh_lock);
+}
+
+static void record_battery_level_locked(void) {
     if (!initialization_done) {
         LOG_WRN("Settings not loaded yet, skipping battery record");
         return;
@@ -325,13 +365,13 @@ static void record_battery_level() {
 static void battery_history_work_handler(struct k_work *work) {
     if (!initialization_done) {
         // Settings not yet loaded, skip recording
-        k_work_schedule(&battery_history_work, K_MSEC(1000));
+        bh_schedule(K_MSEC(1000));
         return;
     }
     record_battery_level();
 
     // Schedule next recording
-    k_work_schedule(&battery_history_work, K_MSEC(RECORDING_INTERVAL_MS));
+    bh_schedule(K_MSEC(RECORDING_INTERVAL_MS));
 }
 
 /**
@@ -392,7 +432,7 @@ static int battery_history_settings_commit(void) {
 static int battery_history_event_listener(const zmk_event_t *eh) {
     const struct zmk_battery_state_changed *bev = as_zmk_battery_state_changed(eh);
     if (bev) {
-        k_work_reschedule(&battery_history_work, K_NO_WAIT);
+        bh_reschedule(K_NO_WAIT);
     }
     return ZMK_EV_EVENT_BUBBLE;
 }
@@ -410,10 +450,9 @@ static int battery_history_activity_listener(const zmk_event_t *eh) {
         // Record current level before sleep
         record_battery_level();
 #ifdef CONFIG_ZMK_BATTERY_HISTORY_FORCE_SAVE_ON_SLEEP
-        // Force save any unsaved data
-        if (unsaved_count > 0) {
-            save_history();
-        }
+        // Force save any unsaved data (save_history() returns at once when nothing is unsaved;
+        // it reads unsaved_count under bh_lock, which this thread must not read without it).
+        save_history();
 #endif
     }
     return ZMK_EV_EVENT_BUBBLE;
@@ -432,7 +471,7 @@ static int battery_history_init(void) {
             MAX_ENTRIES, CONFIG_ZMK_BATTERY_HISTORY_INTERVAL_MINUTES, SAVE_LEVEL_THRESHOLD);
 
     // Start
-    k_work_schedule(&battery_history_work, K_NO_WAIT);
+    bh_schedule(K_NO_WAIT);
 
     return 0;
 }
@@ -457,6 +496,11 @@ int zmk_battery_history_get_entry(int index, struct zmk_battery_history_entry *e
 int zmk_battery_history_get_current_level(void) { return current_battery_level; }
 
 int zmk_battery_history_clear(void) {
+    /* Called from the Studio RPC thread on user request; it may wait for a save in progress.
+     * Readers (zmk_battery_history_get_*) stay lock-free on purpose: they run on the system work
+     * queue (send work), and making them wait for a multi-second save would bring the stall
+     * back. A torn read there yields one odd history entry, not lost key events. */
+    k_mutex_lock(&bh_lock, K_FOREVER);
     int cleared = history_count;
 
     history_head = 0;
@@ -475,6 +519,7 @@ int zmk_battery_history_clear(void) {
         .count = (uint16_t)history_count,
     };
     settings_save_one("bh/p", &state, sizeof(state));
+    k_mutex_unlock(&bh_lock);
 
     LOG_INF("Battery history cleared: %d entries removed", cleared);
     return cleared;

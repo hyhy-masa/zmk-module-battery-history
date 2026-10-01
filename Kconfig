@@ -3,6 +3,8 @@ config ZMK_BATTERY_HISTORY
     bool "Enable battery history tracking"
     depends on ZMK_BATTERY_REPORTING
     depends on SETTINGS
+    # The record/save work runs on the low priority queue (battery_history.c, bh_schedule).
+    select ZMK_LOW_PRIORITY_WORK_QUEUE
     help
       Track battery level over time and store history in persistent storage.
       This allows users to view battery consumption patterns.
